@@ -1,5 +1,5 @@
 Flask==2.2.5
-tensorflow-cpu==2.19.0
-Pillow
-numpy
 gunicorn
+numpy==1.26.4
+Pillow
+tflite-runtime==2.14.0
