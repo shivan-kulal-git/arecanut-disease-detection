@@ -1,0 +1,10 @@
+<!doctype html>
+<html>
+  <body>
+    <h2>Prediction</h2>
+    <p>Label: <strong>{{ label }}</strong></p>
+    <p>Confidence: <strong>{{ '%.2f' % (confidence*100) }}%</strong></p>
+    <p>Uploaded file: <img src="/uploads/{{ filename }}" style="max-width:300px"></p>
+    <p><a href="/">Try another image</a></p>
+  </body>
+</html>
