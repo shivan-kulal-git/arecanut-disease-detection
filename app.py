@@ -1,9 +1,9 @@
-# app.py (TFLite-only, Render-friendly) — updated
+# app.py (TFLite-only, Render-friendly) — fixed for ambiguous numpy truth error
 import os
 import json
 import logging
 import numpy as np
-from flask import Flask, request, render_template, send_from_directory, abort, jsonify
+from flask import Flask, request, render_template, send_from_directory, jsonify
 from PIL import Image
 from werkzeug.utils import secure_filename
 
@@ -52,32 +52,26 @@ if not os.path.exists(CLASS_MAP):
 with open(CLASS_MAP, "r") as f:
     class_indices_raw = json.load(f)
 
-# class_indices may be either {"class_name": idx} or {"0": "class_name"} etc.
 # Normalize to idx -> class_name (int keys)
 idx_to_class = {}
+# Case 1: keys are numeric strings -> {"0": "class_name", ...}
 if all(isinstance(k, str) and k.isdigit() for k in class_indices_raw.keys()):
-    # keys are numeric strings -> map int(key) -> value (class name)
     for k, v in class_indices_raw.items():
         idx_to_class[int(k)] = v
 else:
-    # assume format {"class_name": idx}
-    for k, v in class_indices_raw.items():
-        try:
+    # Case 2: original Keras train_gen.class_indices style {"class_name": idx}
+    try:
+        for k, v in class_indices_raw.items():
             idx = int(v)
             idx_to_class[idx] = k
-        except Exception:
-            # fallback: if values are strings and appear to be class names
-            # try invert if values unique
-            pass
-
-if not idx_to_class:
-    # final attempt: invert mapping (value->key)
-    for k, v in class_indices_raw.items():
+    except Exception:
+        # Last-resort attempt: invert mapping if values appear unique
         try:
-            idx = int(v)
-            idx_to_class[idx] = k
+            inv = {v: k for k, v in class_indices_raw.items()}
+            for k, v in inv.items():
+                idx = int(k)
+                idx_to_class[idx] = v
         except Exception:
-            # if values are indices encoded as strings use that
             pass
 
 if not idx_to_class:
@@ -92,7 +86,7 @@ try:
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
     logger.info("TFLite interpreter loaded. Input details: %s", input_details)
-except Exception as e:
+except Exception:
     logger.exception("Failed to load TFLite interpreter.")
     raise
 
@@ -102,22 +96,32 @@ def allowed_file(filename):
     return ext in ALLOWED_EXT
 
 # Helper to determine expected input shape & dtype
-
 def _get_input_size_and_dtype():
     """
     Robustly return (target_size (W,H), expected_dtype).
-    Handles numpy scalars / shape signatures safely.
+    Handles numpy scalars / shape signatures safely without using truthiness on arrays.
     """
     inp = input_details[0]
-    # prefer shape_signature if available (may contain -1)
-    shape = inp.get("shape_signature") or inp.get("shape")
-    # defensive: convert to plain Python ints where possible
-    try:
-        # shape may be a list/tuple of numpy scalars; convert element-wise to int if possible
-        shape_list = [int(x) for x in shape]
-    except Exception:
-        # fallback defaults
+
+    # Use shape_signature if explicitly present, otherwise shape.
+    shape_sig = inp.get("shape_signature", None)
+    shape = None
+    if shape_sig is not None:
+        shape = shape_sig
+    else:
+        shape = inp.get("shape", None)
+
+    # Defensive: if shape is a numpy array / list / tuple, convert to Python ints
+    shape_list = None
+    if shape is None:
         shape_list = [-1, 224, 224, 3]
+    else:
+        try:
+            # If numpy array, make it iterable; convert each entry to int
+            shape_list = [int(x) for x in np.asarray(shape).tolist()]
+        except Exception:
+            # fallback
+            shape_list = [-1, 224, 224, 3]
 
     # Expect shape like [batch, H, W, C]
     if len(shape_list) >= 4:
@@ -132,6 +136,7 @@ def _get_input_size_and_dtype():
     # dtype: try to convert to numpy dtype
     dtype = inp.get("dtype", np.float32)
     try:
+        # input_details dtype sometimes already a numpy dtype object
         expected_dtype = np.dtype(dtype)
     except Exception:
         expected_dtype = np.float32
@@ -147,14 +152,20 @@ def preprocess_image(path, target_size=None):
     """
     img = Image.open(path).convert("RGB")
 
-    # get expected size + dtype if not provided
+    # get expected size + dtype
+    model_size, expected_dtype = _get_input_size_and_dtype()
+    # if caller provided an explicit target_size, use it (expecting a (W,H) tuple)
     if target_size is None:
-        target_size, expected_dtype = _get_input_size_and_dtype()
+        target_size_used = model_size
     else:
-        _, expected_dtype = _get_input_size_and_dtype()
+        # Make sure the provided target_size is (W,H) ints
+        try:
+            target_size_used = (int(target_size[0]), int(target_size[1]))
+        except Exception:
+            target_size_used = model_size
 
     # PIL resize expects (width, height)
-    img = img.resize(target_size, Image.BILINEAR)
+    img = img.resize(target_size_used, Image.BILINEAR)
 
     arr = np.array(img).astype(np.float32) / 255.0
 
@@ -164,13 +175,16 @@ def preprocess_image(path, target_size=None):
 
     # Final dtype cast to what the model expects
     if not isinstance(expected_dtype, np.dtype):
-        expected_dtype = np.dtype(expected_dtype)
-    # if arrays mismatched (e.g. model expects uint8), cast now
+        try:
+            expected_dtype = np.dtype(expected_dtype)
+        except Exception:
+            expected_dtype = np.float32
+
+    # If model expects uint8 or other, convert (TFLite models sometimes expect uint8)
     if arr.dtype != expected_dtype:
         try:
             arr = arr.astype(expected_dtype)
         except Exception:
-            # as a safe fallback use float32
             arr = arr.astype(np.float32)
 
     return arr
@@ -189,19 +203,26 @@ def predict_tflite(image_path):
     interpreter.set_tensor(input_details[0]["index"], inp)
     interpreter.invoke()
     raw_out = interpreter.get_tensor(output_details[0]["index"])
-    # Make sure raw_out is an array and has the expected final dimension
     raw_out = np.asarray(raw_out)
+
+    # Normalize output vector extraction
     if raw_out.ndim == 2 and raw_out.shape[0] == 1:
         out_vec = raw_out[0]
     elif raw_out.ndim == 1:
         out_vec = raw_out
     else:
-        # try to flatten last dimension
-        out_vec = raw_out.reshape(-1, raw_out.shape[-1])[0]
+        # reshape to (N, classes) and take first row
+        try:
+            out_vec = raw_out.reshape(-1, int(raw_out.shape[-1]))[0]
+        except Exception:
+            out_vec = raw_out.flatten()
 
-    # safe argmax & cast
+    out_vec = np.asarray(out_vec, dtype=np.float32)
+    if out_vec.size == 0:
+        raise ValueError("Model output is empty")
+
     idx = int(np.argmax(out_vec))
-    conf = float(out_vec[idx]) if out_vec.size > idx else float(np.max(out_vec))
+    conf = float(out_vec[idx]) if idx < out_vec.size else float(np.max(out_vec))
     label = idx_to_class.get(idx, f"label_{idx}")
     return label, conf, out_vec.tolist()
 
@@ -211,9 +232,11 @@ def predict_tflite(image_path):
 def index_route():
     return render_template("index.html")
 
+
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
     return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
 
 @app.route("/", methods=["POST"])
 def upload_predict():
@@ -240,12 +263,13 @@ def upload_predict():
     try:
         return render_template("result.html", label=label, confidence=conf, filename=filename)
     except Exception:
-        # fallback JSON
         return jsonify({"label": label, "confidence": conf, "raw_output": raw_output})
+
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
