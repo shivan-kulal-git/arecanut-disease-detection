@@ -102,70 +102,109 @@ def allowed_file(filename):
     return ext in ALLOWED_EXT
 
 # Helper to determine expected input shape & dtype
+
 def _get_input_size_and_dtype():
-    # Choose first input (most models have single input)
+    """
+    Robustly return (target_size (W,H), expected_dtype).
+    Handles numpy scalars / shape signatures safely.
+    """
     inp = input_details[0]
-    shape = inp.get("shape") or inp.get("shape_signature")
-    # shape may be [1, H, W, C] or [-1, H, W, C] or [None, H, W, C]
-    if shape is None or len(shape) < 4:
-        target_h, target_w = 224, 224
+    # prefer shape_signature if available (may contain -1)
+    shape = inp.get("shape_signature") or inp.get("shape")
+    # defensive: convert to plain Python ints where possible
+    try:
+        # shape may be a list/tuple of numpy scalars; convert element-wise to int if possible
+        shape_list = [int(x) for x in shape]
+    except Exception:
+        # fallback defaults
+        shape_list = [-1, 224, 224, 3]
+
+    # Expect shape like [batch, H, W, C]
+    if len(shape_list) >= 4:
+        h = shape_list[1]
+        w = shape_list[2]
+        # if either is <=0 (unknown), fallback to 224
+        target_h = h if (isinstance(h, int) and h > 0) else 224
+        target_w = w if (isinstance(w, int) and w > 0) else 224
     else:
-        # take positions 1 and 2 as H, W
-        try:
-            target_h = int(shape[1]) if shape[1] not in (-1, None) else 224
-            target_w = int(shape[2]) if shape[2] not in (-1, None) else 224
-        except Exception:
-            # fallback
-            target_h, target_w = 224, 224
-    # dtype may be numpy dtype object or string
-    dtype = inp.get("dtype")
-    # if dtype is a numpy type object, convert to np.dtype
+        target_w, target_h = 224, 224
+
+    # dtype: try to convert to numpy dtype
+    dtype = inp.get("dtype", np.float32)
     try:
         expected_dtype = np.dtype(dtype)
     except Exception:
-        # if tflite returned something else, assume float32
         expected_dtype = np.float32
-    return (target_w, target_h), expected_dtype  # PIL resize expects (W, H)
 
-# Preprocess
+    # Return PIL-style size (W, H) and dtype
+    return (int(target_w), int(target_h)), expected_dtype
+
+
 def preprocess_image(path, target_size=None):
+    """
+    Load image, resize to (W,H), convert to float (0..1) and cast to expected dtype.
+    Always returns a batched array: shape (1, H, W, C)
+    """
     img = Image.open(path).convert("RGB")
+
+    # get expected size + dtype if not provided
     if target_size is None:
         target_size, expected_dtype = _get_input_size_and_dtype()
     else:
         _, expected_dtype = _get_input_size_and_dtype()
 
-    # Resize (PIL expects (width, height))
+    # PIL resize expects (width, height)
     img = img.resize(target_size, Image.BILINEAR)
+
     arr = np.array(img).astype(np.float32) / 255.0
 
-    # Ensure batch dim
+    # Ensure batch dim (1, H, W, C)
     if arr.ndim == 3:
         arr = np.expand_dims(arr, axis=0)
 
-    # Cast to expected dtype if needed
-    expected_dtype = expected_dtype if isinstance(expected_dtype, np.dtype) else np.dtype(expected_dtype)
+    # Final dtype cast to what the model expects
+    if not isinstance(expected_dtype, np.dtype):
+        expected_dtype = np.dtype(expected_dtype)
+    # if arrays mismatched (e.g. model expects uint8), cast now
     if arr.dtype != expected_dtype:
-        arr = arr.astype(expected_dtype)
+        try:
+            arr = arr.astype(expected_dtype)
+        except Exception:
+            # as a safe fallback use float32
+            arr = arr.astype(np.float32)
 
-    # If model expects a different tensor order (rare), user can adjust here.
     return arr
 
-# Prediction
-def predict_tflite(image_path):
-    inp = preprocess_image(image_path)
-    try:
-        interpreter.set_tensor(input_details[0]["index"], inp)
-        interpreter.invoke()
-        out = interpreter.get_tensor(output_details[0]["index"])[0]
-    except Exception as e:
-        logger.exception("TFLite invocation error")
-        raise
 
-    idx = int(np.argmax(out))
-    conf = float(out[idx])
+def predict_tflite(image_path):
+    """
+    Calls the TFLite interpreter in a defensive way and returns (label, confidence, raw_out).
+    """
+    inp = preprocess_image(image_path)
+    # sanity-check shapes & types
+    if inp.ndim != 4:
+        raise ValueError(f"Preprocessed input must be 4-D (B,H,W,C). Got shape {inp.shape}")
+
+    # Set tensor and invoke
+    interpreter.set_tensor(input_details[0]["index"], inp)
+    interpreter.invoke()
+    raw_out = interpreter.get_tensor(output_details[0]["index"])
+    # Make sure raw_out is an array and has the expected final dimension
+    raw_out = np.asarray(raw_out)
+    if raw_out.ndim == 2 and raw_out.shape[0] == 1:
+        out_vec = raw_out[0]
+    elif raw_out.ndim == 1:
+        out_vec = raw_out
+    else:
+        # try to flatten last dimension
+        out_vec = raw_out.reshape(-1, raw_out.shape[-1])[0]
+
+    # safe argmax & cast
+    idx = int(np.argmax(out_vec))
+    conf = float(out_vec[idx]) if out_vec.size > idx else float(np.max(out_vec))
     label = idx_to_class.get(idx, f"label_{idx}")
-    return label, conf, out.tolist()
+    return label, conf, out_vec.tolist()
+
 
 # Routes
 @app.route("/", methods=["GET"])
